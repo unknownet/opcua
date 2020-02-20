@@ -722,8 +722,14 @@ func (s *SecureChannel) openSecureChannel(requestType ua.SecurityTokenRequestTyp
 			return errors.Errorf("got %T, want OpenSecureChannelResponse", req)
 		}
 		s.securityTokenID = resp.SecurityToken.TokenID
-		s.lifetime = resp.SecurityToken.RevisedLifetime
-		debug.Printf("received security token tokenID: %v, createdAt: %v, lifetime %v", resp.SecurityToken.TokenID, resp.SecurityToken.CreatedAt, resp.SecurityToken.RevisedLifetime)
+
+		// allow the client to specify a smaller lifetime if desired
+		if resp.SecurityToken.RevisedLifetime < s.cfg.Lifetime {
+			s.lifetime = resp.SecurityToken.RevisedLifetime
+		} else {
+			s.lifetime = s.cfg.Lifetime
+		}
+		debug.Printf("received security token tokenID: %v, createdAt: %v, lifetime %v", resp.SecurityToken.TokenID, resp.SecurityToken.CreatedAt, s.lifetime)
 
 		s.enc, err = uapolicy.Symmetric(s.cfg.SecurityPolicyURI, nonce, resp.ServerNonce)
 		if err != nil {
