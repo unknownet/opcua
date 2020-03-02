@@ -301,6 +301,8 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 		return nil, errors.Errorf("sechan: decode chunk failed: %s", err)
 	}
 
+	var decryptWith *channelInstance
+
 	switch m.MessageType {
 	case "OPN":
 		debug.Printf("uasc OPN Request")
@@ -321,19 +323,7 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 
 		s.cfg.SecurityPolicyURI = m.SecurityPolicyURI
 
-		// register the newly opened instance
-		// we have to do this here because the call to `verifyAndDecrypt` below assumes it is set
-
-		if _, ok := s.instances[m.MessageHeader.SecureChannelID]; ok {
-			// since there's already an existing entry for this SecureChannelID it means we are in a renewal
-			s.instances[m.MessageHeader.SecureChannelID] = append(
-				s.instances[m.MessageHeader.SecureChannelID],
-				s.openingInstance,
-			)
-		} else {
-			s.instances[m.MessageHeader.SecureChannelID] = []*channelInstance{s.openingInstance}
-		}
-
+		decryptWith = s.openingInstance
 	case "CLO":
 		return nil, io.EOF
 	case "MSG":
@@ -343,7 +333,7 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	}
 
 	// Decrypt the block and put data back into m.Data
-	m.Data, err = s.verifyAndDecrypt(m, b)
+	m.Data, err = s.verifyAndDecrypt(m, b, decryptWith)
 	if err != nil {
 		return nil, err
 	}
@@ -357,7 +347,13 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	return m, nil
 }
 
-func (s *SecureChannel) verifyAndDecrypt(m *MessageChunk, b []byte) ([]byte, error) {
+// verifyAndDecrypt verifies and optionally decrypts a message. if `instance` is given, then it will only use that
+// state. Otherwise it will look up states by channel ID and try each.
+func (s *SecureChannel) verifyAndDecrypt(m *MessageChunk, b []byte, instance *channelInstance) ([]byte, error) {
+	if instance != nil {
+		return instance.verifyAndDecrypt(m, b)
+	}
+
 	instances := s.getInstancesBySecureChannelID(m.MessageHeader.SecureChannelID)
 	if instances == nil || len(instances) == 0 {
 		return nil, errors.Errorf("sechan: unable to find instance for SecureChannelID=%d", m.MessageHeader.SecureChannelID)
@@ -369,9 +365,13 @@ func (s *SecureChannel) verifyAndDecrypt(m *MessageChunk, b []byte) ([]byte, err
 	)
 
 	for i := len(instances) - 1; i >= 0; i-- {
+		// instances[i].Lock()
 		if verified, err = instances[i].verifyAndDecrypt(m, b); err == nil {
+			// instances[i].Unlock()
 			return verified, nil
 		}
+		// instances[i].Unlock()
+		debug.Printf("attempting an older channel state...")
 	}
 
 	return nil, err
@@ -447,7 +447,18 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 
 	s.openingInstance = newChannelInstance(s)
 
+	if requestType == ua.SecurityTokenRequestTypeRenew {
+		// TODO: lock? sequenceNumber++?
+		// this seems racy. if another request goes out while the other open request is in flight then won't an error
+		// be raised on the server? can the sequenceNumber be as "global" as the request ID?
+		s.openingInstance.sequenceNumber = instance.sequenceNumber
+	}
+
+	// trigger cleanup after we are all done
 	defer func() {
+		if s.openingInstance == nil || s.openingInstance.state != channelActive {
+			debug.Printf("failed to open a new secure channel")
+		}
 		s.openingInstance = nil
 	}()
 
@@ -484,12 +495,27 @@ func (s *SecureChannel) handleOpenSecureChannelResponse(resp *ua.OpenSecureChann
 	instance.createdAt = resp.SecurityToken.CreatedAt
 	instance.revisedLifetime = time.Millisecond * time.Duration(resp.SecurityToken.RevisedLifetime)
 
+	// allow the client to specify a lifetime that is smaller
+	if int64(s.cfg.Lifetime) < instance.revisedLifetime.Milliseconds() {
+		instance.revisedLifetime = time.Millisecond * time.Duration(s.cfg.Lifetime)
+	}
+
 	if instance.algo, err = uapolicy.Symmetric(s.cfg.SecurityPolicyURI, localNonce, resp.ServerNonce); err != nil {
 		return err
 	}
 
 	s.instancesMu.Lock()
 	defer s.instancesMu.Unlock()
+
+	if _, ok := s.instances[resp.SecurityToken.ChannelID]; ok {
+		// since there's already an existing entry for this SecureChannelID it means we are in a renewal
+		s.instances[resp.SecurityToken.ChannelID] = append(
+			s.instances[resp.SecurityToken.ChannelID],
+			s.openingInstance,
+		)
+	} else {
+		s.instances[resp.SecurityToken.ChannelID] = []*channelInstance{s.openingInstance}
+	}
 
 	s.activeInstance = instance
 
@@ -527,6 +553,7 @@ func (s *SecureChannel) scheduleRenewal(instance *channelInstance) {
 }
 
 func (s *SecureChannel) renew(instance *channelInstance) error {
+	// lock ensure no one else renews this at the same time
 	instance.Lock()
 	defer instance.Unlock()
 
@@ -656,28 +683,31 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 ) (<-chan *response, error) {
 
 	instance.Lock()
-	defer instance.Unlock()
 
 	m, err := instance.newRequestMessage(req, reqID, authToken, timeout)
 	if err != nil {
+		instance.Unlock()
 		return nil, err
 	}
 
 	b, err := m.Encode()
 	if err != nil {
+		instance.Unlock()
 		return nil, err
 	}
 
 	b, err = instance.signAndEncrypt(m, b)
 	if err != nil {
+		instance.Unlock()
 		return nil, err
 	}
+
+	instance.Unlock()
 
 	var resp chan *response
 
 	if respRequired {
 		// register the handler if a callback was passed
-		// TODO: set chan len to 1
 		resp = make(chan *response, 1)
 
 		s.handlersMu.Lock()
@@ -753,8 +783,11 @@ func mergeChunks(chunks []*MessageChunk) ([]byte, error) {
 	// todo(fs): check if this is correct and necessary
 	// sort.Sort(bySequence(chunks))
 
-	var b []byte
-	var seqnr uint32
+	var (
+		b     []byte
+		seqnr uint32
+	)
+
 	for _, c := range chunks {
 		if c.SequenceHeader.SequenceNumber == seqnr {
 			continue // duplicate chunk
