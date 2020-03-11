@@ -17,7 +17,6 @@ type instanceState int
 const (
 	channelOpening instanceState = iota
 	channelActive
-	channelClosed
 )
 
 type channelInstance struct {

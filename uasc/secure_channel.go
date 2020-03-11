@@ -355,7 +355,7 @@ func (s *SecureChannel) verifyAndDecrypt(m *MessageChunk, b []byte, instance *ch
 	}
 
 	instances := s.getInstancesBySecureChannelID(m.MessageHeader.SecureChannelID)
-	if instances == nil || len(instances) == 0 {
+	if len(instances) == 0 {
 		return nil, errors.Errorf("sechan: unable to find instance for SecureChannelID=%d", m.MessageHeader.SecureChannelID)
 	}
 
@@ -570,7 +570,7 @@ func (s *SecureChannel) scheduleExpiration(instance *channelInstance) {
 
 	debug.Printf("channelID %d/%d will expire at %s", instance.secureChannelID, instance.securityTokenID, when.UTC().Format(time.RFC3339))
 
-	t := time.NewTimer(when.Sub(time.Now()))
+	t := time.NewTimer(time.Until(when))
 
 	s.closingMu.RLock()
 	defer s.closingMu.RUnlock()
