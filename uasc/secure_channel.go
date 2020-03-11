@@ -496,7 +496,7 @@ func (s *SecureChannel) handleOpenSecureChannelResponse(resp *ua.OpenSecureChann
 	instance.revisedLifetime = time.Millisecond * time.Duration(resp.SecurityToken.RevisedLifetime)
 
 	// allow the client to specify a lifetime that is smaller
-	if int64(s.cfg.Lifetime) < instance.revisedLifetime.Milliseconds() {
+	if int64(s.cfg.Lifetime) < int64(instance.revisedLifetime/time.Millisecond) {
 		instance.revisedLifetime = time.Millisecond * time.Duration(s.cfg.Lifetime)
 	}
 
