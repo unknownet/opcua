@@ -67,7 +67,7 @@ func (c *channelInstance) newRequestMessage(req ua.Request, reqID uint32, authTo
 
 	reqHdr := &ua.RequestHeader{
 		AuthenticationToken: authToken,
-		Timestamp:           time.Now(),
+		Timestamp:           c.sc.time(),
 		RequestHandle:       reqID, // TODO: can I cheat like this?
 	}
 
