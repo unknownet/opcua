@@ -178,7 +178,7 @@ func (c *channelInstance) signAndEncrypt(m *Message, b []byte) ([]byte, error) {
 	return append(b[:headerLength], p...), nil
 }
 
-func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, b []byte) ([]byte, error) {
+func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) ([]byte, error) {
 	if c.sc.cfg.SecurityMode == ua.MessageSecurityModeNone {
 		return m.Data, nil
 	}
@@ -192,6 +192,9 @@ func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, b []byte) ([]byte, e
 	} else {
 		headerLength += m.SymmetricSecurityHeader.Len()
 	}
+
+	b := make([]byte, len(r))
+	copy(b, r)
 
 	if c.sc.cfg.SecurityMode == ua.MessageSecurityModeSignAndEncrypt || isAsymmetric {
 		p, err := c.algo.Decrypt(b[headerLength:])
