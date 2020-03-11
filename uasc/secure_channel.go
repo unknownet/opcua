@@ -521,8 +521,10 @@ func (s *SecureChannel) handleOpenSecureChannelResponse(resp *ua.OpenSecureChann
 
 	debug.Printf("received security token: channelID=%d tokenID=%d createdAt=%s lifetime=%s", instance.secureChannelID, instance.securityTokenID, instance.createdAt.Format(time.RFC3339), instance.revisedLifetime)
 
-	go s.scheduleRenewal(instance)
-	go s.scheduleExpiration(instance)
+	if s.cfg.SecurityMode != ua.MessageSecurityModeNone {
+		go s.scheduleRenewal(instance)
+		go s.scheduleExpiration(instance)
+	}
 
 	return
 }
