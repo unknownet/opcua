@@ -14,6 +14,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gopcua/opcua/debug"
@@ -26,7 +27,7 @@ import (
 
 // GetEndpoints returns the available endpoint descriptions for the server.
 func GetEndpoints(endpoint string) ([]*ua.EndpointDescription, error) {
-	c := NewClient(endpoint)
+	c := NewClient(endpoint, AutoReconnect(false))
 	if err := c.Dial(context.Background()); err != nil {
 		return nil, err
 	}
@@ -80,6 +81,17 @@ func (a bySecurityLevel) Len() int           { return len(a) }
 func (a bySecurityLevel) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a bySecurityLevel) Less(i, j int) bool { return a[i].SecurityLevel < a[j].SecurityLevel }
 
+const reconnectPeriod = 100 * time.Millisecond
+
+type ConnectState uint8
+
+const (
+	Closed ConnectState = iota
+	Connecting
+	Open
+	Broken
+)
+
 // Client is a high-level client for an OPC/UA server.
 // It establishes a secure channel and a session.
 type Client struct {
@@ -106,8 +118,13 @@ type Client struct {
 	subscriptions map[uint32]*Subscription
 	subMux        sync.RWMutex
 
+	// onMonitorFailure intercept monitor channel error msg
+	onMonitorFailure func(error, func())
 	//cancelMonitor cancels the monitorChannel goroutine
 	cancelMonitor context.CancelFunc
+
+	// state of the client
+	state atomic.Value // ConnectState
 
 	// once initializes session
 	once sync.Once
@@ -126,13 +143,27 @@ type Client struct {
 // https://godoc.org/github.com/gopcua/opcua#Option
 func NewClient(endpoint string, opts ...Option) *Client {
 	cfg, sessionCfg := ApplyConfig(opts...)
-	return &Client{
+	c := Client{
 		endpointURL:   endpoint,
 		cfg:           cfg,
 		sessionCfg:    sessionCfg,
 		subscriptions: make(map[uint32]*Subscription),
 	}
+	c.state.Store(Closed)
+	return &c
 }
+
+type ReconnectState uint8
+
+const (
+	None ReconnectState = iota
+	RecreateSecureChannel
+	RestoreSession
+	RecreateSession
+	RestoreSubscription
+	RecreateSubscription
+	NonRecoverable
+)
 
 // Connect establishes a secure channel and creates a new session.
 func (c *Client) Connect(ctx context.Context) (err error) {
@@ -143,6 +174,7 @@ func (c *Client) Connect(ctx context.Context) (err error) {
 	if c.sechan != nil {
 		return errors.Errorf("already connected")
 	}
+	c.state.Store(Connecting)
 	if err := c.Dial(ctx); err != nil {
 		return err
 	}
@@ -155,7 +187,130 @@ func (c *Client) Connect(ctx context.Context) (err error) {
 		_ = c.Close()
 		return err
 	}
+	c.state.Store(Open)
+	go c.handleConnection(ctx)
 	return nil
+}
+
+// handleConnection manages connection alteration
+func (c *Client) handleConnection(ctx context.Context) {
+
+	tickC := make(chan struct{})
+	var fixState atomic.Value // ReconnectState
+	fixState.Store(None)
+
+	c.onMonitorFailure = func(err error, prev func()) {
+
+		if err == io.EOF && c.State() == Closed {
+			tickC <- struct{}{}
+			return
+		}
+
+		// tell the handler the connection is broken
+		c.state.Store(Broken)
+
+		if !c.cfg.AutoReconnect {
+			fixState.Store(None)
+			return
+		}
+
+		fix := RecreateSecureChannel
+
+		switch err {
+		case syscall.ECONNREFUSED:
+			fix = NonRecoverable
+		}
+
+		if connErr, ok := err.(*uacp.Error); ok {
+			status := ua.StatusCode(connErr.ErrorCode)
+			switch status {
+			case ua.StatusBadSecureChannelIDInvalid:
+				fix = RecreateSecureChannel
+			case ua.StatusBadSessionIDInvalid:
+				prev()
+				fix = RecreateSession
+			case ua.StatusBadSubscriptionIDInvalid:
+				prev()
+				fix = RecreateSubscription
+			case ua.StatusBadCertificateInvalid:
+				// todo: recreate server certificate
+				fallthrough
+			default:
+				fix = RecreateSecureChannel
+			}
+		}
+
+		fixState.Store(fix)
+		tickC <- struct{}{}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tickC:
+
+			switch c.State() {
+			case Closed:
+				return
+
+			case Open:
+				// Do nothing
+			case Broken:
+
+				if !c.cfg.AutoReconnect {
+					return
+				}
+				c.state.Store(Connecting)
+
+				// TODO: Suspend Publish processing
+
+				for {
+					fixe := fixState.Load().(ReconnectState)
+					if fixe == None {
+						break
+					}
+
+					switch fixe {
+
+					case RecreateSecureChannel:
+
+						// TODO: implement recreate secure channel
+						// go to RestoreSession if successful
+						fixState.Store(None)
+
+					case RestoreSession:
+
+						// TODO: implement restore session
+						// go to RestoreSubscription and set state to Open if successful
+						fixState.Store(None)
+
+					case RecreateSession:
+
+						// TODO: implement recreate session
+						// go to RecreateSubscription and set state to Open if successful
+						fixState.Store(None)
+
+					case RestoreSubscription:
+
+						// TODO: implement restore subscription
+						fixState.Store(None)
+
+					case RecreateSubscription:
+
+						// TODO: implement recreate subscription
+						fixState.Store(None)
+
+					case NonRecoverable:
+						// TODO: implement
+						// NOTE: should We store the error
+						return
+					}
+				}
+				// TODO: Resume Publish processing
+			}
+		}
+	}
 }
 
 // Dial establishes a secure channel.
@@ -208,6 +363,16 @@ func (c *Client) monitorChannel(ctx context.Context) {
 		default:
 			msg := c.sechan.Receive(ctx)
 			if msg.Err != nil {
+				prevent := false
+				c.onMonitorFailure(msg.Err, func() {
+					prevent = true
+				})
+
+				// prevent err message from stopping monitorChannel
+				if prevent {
+					continue
+				}
+
 				if msg.Err == io.EOF {
 					debug.Printf("Connection closed")
 				} else {
@@ -227,6 +392,7 @@ func (c *Client) Close() error {
 	// try to close the session but ignore any error
 	// so that we close the underlying channel and connection.
 	_ = c.CloseSession()
+	c.state.Store(Closed)
 	if c.cancelMonitor != nil {
 		c.cancelMonitor()
 	}
@@ -252,6 +418,10 @@ func (c *Client) SetWriteBuffer(bytes int) error {
 		return errNotConnected
 	}
 	return c.conn.SetWriteBuffer(bytes)
+}
+
+func (c *Client) State() ConnectState {
+	return c.state.Load().(ConnectState)
 }
 
 // Session returns the active session.
