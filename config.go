@@ -29,6 +29,7 @@ func DefaultClientConfig() *uasc.Config {
 		Lifetime:          uint32(time.Hour / time.Millisecond),
 		RequestTimeout:    10 * time.Second,
 		AutoReconnect:     true,
+		ReconnectInterval: 5 * time.Second,
 	}
 }
 
@@ -80,6 +81,13 @@ func ApplicationURI(s string) Option {
 func AutoReconnect(b bool) Option {
 	return func(c *uasc.Config, sc *uasc.SessionConfig) {
 		c.AutoReconnect = b
+	}
+}
+
+// ReconnectInterval is interval duration between each reconnection attempt.
+func ReconnectInterval(d time.Duration) Option {
+	return func(c *uasc.Config, sc *uasc.SessionConfig) {
+		c.ReconnectInterval = d
 	}
 }
 
