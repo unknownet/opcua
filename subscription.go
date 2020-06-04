@@ -2,6 +2,8 @@ package opcua
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gopcua/opcua/debug"
@@ -19,12 +21,18 @@ const (
 	DefaultSubscriptionPriority                   = 0
 )
 
+const terminatedSubscriptionID uint32 = 0xC0CAC01B
+
 type Subscription struct {
 	SubscriptionID            uint32
 	RevisedPublishingInterval time.Duration
 	RevisedLifetimeCount      uint32
 	RevisedMaxKeepAliveCount  uint32
 	Notifs                    chan *PublishNotificationData
+	params                    *SubscriptionParameters
+	monitoredItems            []*MonitoredItem
+	lastSequenceNumber        uint32
+	locker                    *locker
 	c                         *Client
 }
 
@@ -34,6 +42,15 @@ type SubscriptionParameters struct {
 	MaxKeepAliveCount          uint32
 	MaxNotificationsPerPublish uint32
 	Priority                   uint8
+}
+
+type MonitoredItem struct {
+	MonitoredItemID           uint32
+	ItemToMonitor             *ua.ReadValueID
+	MonitoringParameters      *ua.MonitoringParameters
+	MonitoringMode            ua.MonitoringMode
+	TimestampsToReturn        ua.TimestampsToReturn
+	monitoredItemCreateResult *ua.MonitoredItemCreateResult
 }
 
 func NewMonitoredItemCreateRequestWithDefaults(nodeID *ua.NodeID, attributeID ua.AttributeID, clientHandle uint32) *ua.MonitoredItemCreateRequest {
@@ -67,6 +84,7 @@ type PublishNotificationData struct {
 // loops cannot deliver notifications to it anymore
 func (s *Subscription) Cancel() error {
 	s.c.forgetSubscription(s.SubscriptionID)
+	s.locker.close()
 
 	req := &ua.DeleteSubscriptionsRequest{
 		SubscriptionIDs: []uint32{s.SubscriptionID},
@@ -97,6 +115,33 @@ func (s *Subscription) Monitor(ts ua.TimestampsToReturn, items ...*ua.MonitoredI
 	err := s.c.Send(req, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	for _, result := range res.Results {
+		if status := result.StatusCode; status != ua.StatusOK {
+			return nil, status
+		}
+	}
+
+	// store Monitored items
+	monitoredItems := make([]*MonitoredItem, len(items))
+	for i, item := range items {
+		result := res.Results[i]
+
+		monitoredItems[i] = &MonitoredItem{
+			MonitoredItemID:           result.MonitoredItemID,
+			ItemToMonitor:             item.ItemToMonitor,
+			MonitoringParameters:      item.RequestedParameters,
+			MonitoringMode:            item.MonitoringMode,
+			TimestampsToReturn:        ts,
+			monitoredItemCreateResult: result,
+		}
+	}
+
+	s.monitoredItems = append(s.monitoredItems, monitoredItems...)
 	return res, err
 }
 
@@ -107,6 +152,15 @@ func (s *Subscription) Unmonitor(monitoredItemIDs ...uint32) (*ua.DeleteMonitore
 	}
 	var res *ua.DeleteMonitoredItemsResponse
 	err := s.c.Send(req, func(v interface{}) error {
+		return safeAssign(v, &res)
+	})
+	return res, err
+}
+
+// republish executes a synchronous republish request.
+func (s *Subscription) republish(req *ua.RepublishRequest) (*ua.RepublishResponse, error) {
+	var res *ua.RepublishResponse
+	err := s.c.sechan.SendRequest(req, s.c.Session().resp.AuthenticationToken, func(v interface{}) error {
 		return safeAssign(v, &res)
 	})
 	return res, err
@@ -138,6 +192,14 @@ func (s *Subscription) publishTimeout() time.Duration {
 	return timeout
 }
 
+func (s *Subscription) lock() {
+	s.locker.lock()
+}
+
+func (s *Subscription) unlock() {
+	s.locker.unlock()
+}
+
 // Run() starts an infinite loop that sends PublishRequests and delivers received
 // notifications to registered Subscriptions.
 // It is the responsibility of the user to stop no longer needed Run() loops by cancelling ctx
@@ -152,7 +214,17 @@ func (s *Subscription) Run(ctx context.Context) {
 		default:
 			// send the next publish request
 			// note that res contains data even if an error was returned
+			if s.locker.isClosed() {
+				return
+			}
+			if s.locker.isLocked() {
+				s.locker.wait()
+			}
 			res, err := s.publish(acks)
+			if s.locker.isLocked() || s.locker.isClosed() {
+				// drop the reponse
+				continue
+			}
 			switch {
 			case err == ua.StatusBadSequenceNumberUnknown:
 				// At least one ack has been submitted repeatedly
@@ -166,7 +238,11 @@ func (s *Subscription) Run(ctx context.Context) {
 				// irrecoverable error
 				s.c.notifySubscriptionsOfError(ctx, res, err)
 				debug.Printf("subscription %v Run loop stopped", s.SubscriptionID)
-				return
+				if !s.c.cfg.AutoReconnect {
+					return
+				}
+				s.locker.lock()
+				continue
 			}
 
 			if res != nil {
@@ -177,6 +253,9 @@ func (s *Subscription) Run(ctx context.Context) {
 						ack := &ua.SubscriptionAcknowledgement{
 							SubscriptionID: res.SubscriptionID,
 							SequenceNumber: i,
+						}
+						if i > atomic.LoadUint32(&s.lastSequenceNumber) {
+							atomic.StoreUint32(&s.lastSequenceNumber, i)
 						}
 						acks = append(acks, ack)
 					}
@@ -241,4 +320,160 @@ func (p *SubscriptionParameters) setDefaults() {
 		// and to explicitly expose the default priority as a constant
 		p.Priority = DefaultSubscriptionPriority
 	}
+}
+
+// recreateSubscriptionAndMonitoredItems recreate a new subscription base of a previous subscription
+// parameters
+func (s *Subscription) recreateSubscriptionAndMonitoredItems() error {
+	if s.SubscriptionID == terminatedSubscriptionID {
+		debug.Printf("Subscription is not in a valid state")
+		return nil
+	}
+
+	params := s.params
+	s.c.forgetSubscription(s.SubscriptionID)
+
+	req := &ua.CreateSubscriptionRequest{
+		RequestedPublishingInterval: float64(params.Interval / time.Millisecond),
+		RequestedLifetimeCount:      params.LifetimeCount,
+		RequestedMaxKeepAliveCount:  params.MaxKeepAliveCount,
+		PublishingEnabled:           true,
+		MaxNotificationsPerPublish:  params.MaxNotificationsPerPublish,
+		Priority:                    params.Priority,
+	}
+	var res *ua.CreateSubscriptionResponse
+	err := s.c.Send(req, func(v interface{}) error {
+		return safeAssign(v, &res)
+	})
+	if err != nil {
+		return err
+	}
+	// TODO: check if necessary
+	if status := res.ResponseHeader.ServiceResult; status != ua.StatusOK {
+		return status
+	}
+
+	s.SubscriptionID = res.SubscriptionID
+	s.RevisedPublishingInterval = time.Duration(res.RevisedPublishingInterval) * time.Millisecond
+	s.RevisedLifetimeCount = res.RevisedLifetimeCount
+	s.RevisedMaxKeepAliveCount = res.RevisedMaxKeepAliveCount
+	atomic.StoreUint32(&s.lastSequenceNumber, 0)
+
+	if err := s.c.registerSubscription(s); err != nil {
+		return err
+	}
+
+	// Sort by timestamp to return
+	itemsByTs := make(map[ua.TimestampsToReturn][]*ua.MonitoredItemCreateRequest)
+	for _, m := range s.monitoredItems {
+
+		if _, ok := itemsByTs[m.TimestampsToReturn]; !ok {
+			itemsByTs[m.TimestampsToReturn] = []*ua.MonitoredItemCreateRequest{}
+		}
+
+		itemsByTs[m.TimestampsToReturn] = append(
+			itemsByTs[m.TimestampsToReturn],
+			&ua.MonitoredItemCreateRequest{
+				ItemToMonitor:       m.ItemToMonitor,
+				MonitoringMode:      m.MonitoringMode,
+				RequestedParameters: m.MonitoringParameters,
+			},
+		)
+	}
+
+	for ts, items := range itemsByTs {
+
+		req := &ua.CreateMonitoredItemsRequest{
+			SubscriptionID:     s.SubscriptionID,
+			TimestampsToReturn: ts,
+			ItemsToCreate:      items,
+		}
+		var res *ua.CreateMonitoredItemsResponse
+		err := s.c.Send(req, func(v interface{}) error {
+			return safeAssign(v, &res)
+		})
+		if err != nil {
+			return err
+		}
+		for _, result := range res.Results {
+			if status := result.StatusCode; status != ua.StatusOK {
+				return status
+			}
+		}
+
+		for i, m := range s.monitoredItems {
+			result := res.Results[i]
+			m.MonitoredItemID = result.MonitoredItemID
+			m.monitoredItemCreateResult = result
+		}
+	}
+
+	return nil
+}
+
+type locker struct {
+	locked   bool
+	closed   bool
+	lockCond *sync.Cond
+	lockMux  sync.Mutex
+}
+
+func newLocker() *locker {
+	l := locker{
+		locked: false,
+		closed: false,
+	}
+	l.lockCond = sync.NewCond(&l.lockMux)
+	return &l
+}
+
+func (l *locker) isLocked() bool {
+	l.lockMux.Lock()
+	defer l.lockMux.Unlock()
+	return l.locked
+}
+
+func (l *locker) isClosed() bool {
+	l.lockMux.Lock()
+	defer l.lockMux.Unlock()
+	return l.closed
+}
+
+func (l *locker) lock() {
+	l.lockMux.Lock()
+	defer l.lockMux.Unlock()
+	if l.locked {
+		return
+	}
+	l.locked = true
+	l.lockCond.Broadcast()
+}
+
+func (l *locker) unlock() {
+	l.lockMux.Lock()
+	defer l.lockMux.Unlock()
+	if !l.locked {
+		return
+	}
+	l.locked = false
+	l.lockCond.Broadcast()
+}
+
+func (l *locker) wait() {
+	l.lockMux.Lock()
+	defer l.lockMux.Unlock()
+	if l.closed {
+		return
+	}
+	for l.locked {
+		l.lockCond.Wait()
+	}
+}
+
+func (l *locker) close() {
+	l.lockMux.Lock()
+	defer l.lockMux.Unlock()
+	l.locked = false
+	l.closed = true
+	l.lockCond.Broadcast()
 }
