@@ -117,7 +117,7 @@ type Client struct {
 	subMux        sync.RWMutex
 
 	// onMonitorFailure intercept monitor channel error msg
-	onMonitorFailure func(error, func())
+	onMonitorFailure func(error) error
 	//cancelMonitor cancels the monitorChannel goroutine
 	cancelMonitor context.CancelFunc
 
@@ -142,10 +142,11 @@ type Client struct {
 func NewClient(endpoint string, opts ...Option) *Client {
 	cfg, sessionCfg := ApplyConfig(opts...)
 	c := Client{
-		endpointURL:   endpoint,
-		cfg:           cfg,
-		sessionCfg:    sessionCfg,
-		subscriptions: make(map[uint32]*Subscription),
+		endpointURL:      endpoint,
+		cfg:              cfg,
+		sessionCfg:       sessionCfg,
+		subscriptions:    make(map[uint32]*Subscription),
+		onMonitorFailure: func(err error) error { return err },
 	}
 	c.state.Store(Closed)
 	return &c
@@ -169,6 +170,11 @@ func (c *Client) Connect(ctx context.Context) (err error) {
 		ctx = context.Background()
 	}
 
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go c.handleConnection(ctx, func() { wg.Done() })
+	wg.Wait()
+
 	if c.sechan != nil {
 		return errors.Errorf("already connected")
 	}
@@ -186,22 +192,21 @@ func (c *Client) Connect(ctx context.Context) (err error) {
 		return err
 	}
 	c.state.Store(Open)
-	go c.handleConnection(ctx)
 	return nil
 }
 
 // handleConnection manages connection alteration
-func (c *Client) handleConnection(ctx context.Context) {
+func (c *Client) handleConnection(ctx context.Context, done func()) {
 
 	tickC := make(chan struct{})
 	var rState atomic.Value // ReconnectState
 	rState.Store(None)
 
-	c.onMonitorFailure = func(err error, prev func()) {
+	c.onMonitorFailure = func(err error) error {
 
 		if err == io.EOF && c.State() == Closed {
 			tickC <- struct{}{}
-			return
+			return err
 		}
 
 		// tell the handler the connection is broken
@@ -209,7 +214,7 @@ func (c *Client) handleConnection(ctx context.Context) {
 
 		if !c.cfg.AutoReconnect {
 			rState.Store(None)
-			return
+			return err
 		}
 
 		fix := RecreateSecureChannel
@@ -219,16 +224,17 @@ func (c *Client) handleConnection(ctx context.Context) {
 			fix = NonRecoverable
 		}
 
+		prev := false
 		if connErr, ok := err.(*uacp.Error); ok {
 			status := ua.StatusCode(connErr.ErrorCode)
 			switch status {
 			case ua.StatusBadSecureChannelIDInvalid:
 				fix = RecreateSecureChannel
 			case ua.StatusBadSessionIDInvalid:
-				prev()
+				prev = true
 				fix = RecreateSession
 			case ua.StatusBadSubscriptionIDInvalid:
-				prev()
+				prev = true
 				fix = RecreateSubscription
 			case ua.StatusBadCertificateInvalid:
 				// todo: recreate server certificate
@@ -240,7 +246,12 @@ func (c *Client) handleConnection(ctx context.Context) {
 
 		rState.Store(fix)
 		tickC <- struct{}{}
+		if prev {
+			return nil
+		}
+		return err
 	}
+	done()
 
 	for {
 		select {
@@ -454,17 +465,15 @@ func (c *Client) monitorChannel(ctx context.Context) {
 		default:
 			msg := c.sechan.Receive(ctx)
 			if msg.Err != nil {
-				prevent := false
-				c.onMonitorFailure(msg.Err, func() {
-					prevent = true
-				})
+
+				err := c.onMonitorFailure(msg.Err)
 
 				// prevent err message from stopping monitorChannel
-				if prevent {
+				if err == nil {
 					continue
 				}
 
-				if msg.Err == io.EOF {
+				if err == io.EOF {
 					debug.Printf("Connection closed")
 				} else {
 					debug.Printf("Received error: %s", msg.Err)
