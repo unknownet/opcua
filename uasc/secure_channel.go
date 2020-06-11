@@ -73,6 +73,9 @@ type SecureChannel struct {
 	// duration of the "open" request.
 	openingInstance *channelInstance
 	openingMu       sync.Mutex
+
+	// errorHandler
+	errorHandlers []chan<- error
 }
 
 func NewSecureChannel(endpoint string, c *uacp.Conn, cfg *Config) (*SecureChannel, error) {
@@ -100,10 +103,11 @@ func NewSecureChannel(endpoint string, c *uacp.Conn, cfg *Config) (*SecureChanne
 	}
 
 	s := &SecureChannel{
-		endpointURL: endpoint,
-		c:           c,
-		cfg:         cfg,
-		requestID:   cfg.RequestIDSeed,
+		endpointURL:   endpoint,
+		c:             c,
+		cfg:           cfg,
+		requestID:     cfg.RequestIDSeed,
+		errorHandlers: []chan<- error{},
 	}
 
 	s.reset()
@@ -147,6 +151,10 @@ func (s *SecureChannel) dispatcher() {
 			return
 		default:
 			resp := s.receive(ctx)
+
+			if resp.Err != nil {
+				s.notifyError(resp.Err)
+			}
 			if resp.Err == io.EOF {
 				return
 			}
@@ -185,6 +193,7 @@ func (s *SecureChannel) receive(ctx context.Context) *response {
 
 		default:
 			chunk, err := s.readChunk()
+
 			if err == io.EOF {
 				debug.Printf("uasc readChunk EOF")
 				return &response{Err: err}
@@ -284,7 +293,10 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	if err == io.EOF || len(b) == 0 { // || s.hasState(secureChannelClosed) {
 		return nil, io.EOF
 	}
-
+	// do not wrap this error since it hides conn error
+	if _, ok := err.(*uacp.Error); ok {
+		return nil, err
+	}
 	if err != nil {
 		return nil, errors.Errorf("sechan: read header failed: %s %#v", err, err)
 	}
@@ -749,6 +761,27 @@ func (s *SecureChannel) nextRequestID() uint32 {
 	return s.requestID
 }
 
+// AddErrorNotifier register a channel
+func (s *SecureChannel) AddErrorNotifier(ch chan<- error) func() {
+	s.errorHandlers = append(s.errorHandlers, ch)
+	return func() {
+		for idx := range s.errorHandlers {
+			if s.errorHandlers[idx] == ch {
+				s.errorHandlers = append(s.errorHandlers[:idx], s.errorHandlers[idx+1:]...)
+			}
+		}
+	}
+}
+
+func (s *SecureChannel) notifyError(err error) {
+	for _, ch := range s.errorHandlers {
+		select {
+		case ch <- err:
+		default:
+		}
+	}
+}
+
 // Close closes an existing secure channel
 func (s *SecureChannel) Close() error {
 	debug.Printf("uasc Close()")
@@ -757,6 +790,16 @@ func (s *SecureChannel) Close() error {
 		close(s.closing)
 		s.reset()
 	}()
+
+	// close pending requests
+	s.handlersMu.Lock()
+	for reqID, ch := range s.handlers {
+		ch <- &response{
+			Err: io.EOF,
+		}
+		delete(s.handlers, reqID)
+	}
+	s.handlersMu.Unlock()
 
 	err := s.SendRequest(&ua.CloseSecureChannelRequest{}, nil, nil)
 
