@@ -79,9 +79,12 @@ type SecureChannel struct {
 	// duration of the "open" request.
 	openingInstance *channelInstance
 	openingMu       sync.Mutex
+
+	// errorCh receive dispatcher errors
+	errCh chan<- error
 }
 
-func NewSecureChannel(endpoint string, c *uacp.Conn, cfg *Config) (*SecureChannel, error) {
+func NewSecureChannel(endpoint string, c *uacp.Conn, cfg *Config, errCh chan<- error) (*SecureChannel, error) {
 	if c == nil {
 		return nil, errors.Errorf("no connection")
 	}
@@ -111,6 +114,7 @@ func NewSecureChannel(endpoint string, c *uacp.Conn, cfg *Config) (*SecureChanne
 		cfg:         cfg,
 		requestID:   cfg.RequestIDSeed,
 		bLockReq:    false,
+		errCh:       errCh,
 	}
 	s.lockReqCnd = sync.NewCond(&s.lockReqMu)
 
@@ -155,6 +159,14 @@ func (s *SecureChannel) dispatcher() {
 			return
 		default:
 			resp := s.receive(ctx)
+
+			if resp.Err != nil {
+				select {
+				case s.errCh <- resp.Err:
+				default:
+				}
+			}
+
 			if resp.Err == io.EOF {
 				return
 			}
@@ -292,7 +304,10 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 	if err == io.EOF || len(b) == 0 { // || s.hasState(secureChannelClosed) {
 		return nil, io.EOF
 	}
-
+	// do not wrap this error since it hides conn error
+	if _, ok := err.(*uacp.Error); ok {
+		return nil, err
+	}
 	if err != nil {
 		return nil, errors.Errorf("sechan: read header failed: %s %#v", err, err)
 	}
@@ -795,6 +810,16 @@ func (s *SecureChannel) Close() error {
 	}()
 
 	s.unlockRequest()
+	// close pending requests
+	s.handlersMu.Lock()
+	for reqID, ch := range s.handlers {
+		ch <- &response{
+			Err: io.EOF,
+		}
+		delete(s.handlers, reqID)
+	}
+	s.handlersMu.Unlock()
+
 	err := s.SendRequest(&ua.CloseSecureChannelRequest{}, nil, nil)
 
 	if err != nil {
