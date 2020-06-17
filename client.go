@@ -106,7 +106,8 @@ type Client struct {
 	conn *uacp.Conn
 
 	// sechan is the open secure channel.
-	sechan *uasc.SecureChannel
+	sechan    *uasc.SecureChannel
+	sechanErr chan error
 
 	// session is the active session.
 	session atomic.Value // *Session
@@ -116,13 +117,14 @@ type Client struct {
 	subscriptions map[uint32]*Subscription
 	subMux        sync.RWMutex
 
-	// onMonitorFailure intercept monitor channel error msg
-	onMonitorFailure func(error) error
 	//cancelMonitor cancels the monitorChannel goroutine
 	cancelMonitor context.CancelFunc
 
 	// state of the client
 	state atomic.Value // ConnectState
+
+	// startDispatcher ensures only one dispatcher is running
+	startDispatcher sync.Once
 
 	// once initializes session
 	once sync.Once
@@ -142,11 +144,11 @@ type Client struct {
 func NewClient(endpoint string, opts ...Option) *Client {
 	cfg, sessionCfg := ApplyConfig(opts...)
 	c := Client{
-		endpointURL:      endpoint,
-		cfg:              cfg,
-		sessionCfg:       sessionCfg,
-		subscriptions:    make(map[uint32]*Subscription),
-		onMonitorFailure: func(err error) error { return err },
+		endpointURL:   endpoint,
+		cfg:           cfg,
+		sessionCfg:    sessionCfg,
+		sechanErr:     make(chan error, 1),
+		subscriptions: make(map[uint32]*Subscription),
 	}
 	c.state.Store(Closed)
 	return &c
@@ -170,11 +172,6 @@ func (c *Client) Connect(ctx context.Context) (err error) {
 		ctx = context.Background()
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go c.handleConnection(ctx, func() { wg.Done() })
-	wg.Wait()
-
 	if c.sechan != nil {
 		return errors.Errorf("already connected")
 	}
@@ -182,6 +179,11 @@ func (c *Client) Connect(ctx context.Context) (err error) {
 	if err := c.Dial(ctx); err != nil {
 		return err
 	}
+
+	c.startDispatcher.Do(func() {
+		go c.dispatcher(ctx)
+	})
+
 	s, err := c.CreateSession(c.sessionCfg)
 	if err != nil {
 		_ = c.Close()
@@ -195,95 +197,74 @@ func (c *Client) Connect(ctx context.Context) (err error) {
 	return nil
 }
 
-// handleConnection manages connection alteration
-func (c *Client) handleConnection(ctx context.Context, done func()) {
+// dispatcher manages connection alteration
+func (c *Client) dispatcher(ctx context.Context) {
 
-	tickC := make(chan struct{})
-	var rState atomic.Value // ReconnectState
-	rState.Store(None)
-
-	c.onMonitorFailure = func(err error) error {
-
-		if err == io.EOF && c.State() == Closed {
-			tickC <- struct{}{}
-			return err
-		}
-
-		// tell the handler the connection is broken
-		c.state.Store(Broken)
-
-		if !c.cfg.AutoReconnect {
-			rState.Store(None)
-			return err
-		}
-
-		fix := RecreateSecureChannel
-
-		switch err {
-		case syscall.ECONNREFUSED:
-			fix = NonRecoverable
-		}
-
-		prev := false
-		if connErr, ok := err.(*uacp.Error); ok {
-			status := ua.StatusCode(connErr.ErrorCode)
-			switch status {
-			case ua.StatusBadSecureChannelIDInvalid:
-				fix = RecreateSecureChannel
-			case ua.StatusBadSessionIDInvalid:
-				prev = true
-				fix = RecreateSession
-			case ua.StatusBadSubscriptionIDInvalid:
-				prev = true
-				fix = RecreateSubscription
-			case ua.StatusBadCertificateInvalid:
-				// todo: recreate server certificate
-				fallthrough
-			default:
-				fix = RecreateSecureChannel
-			}
-		}
-
-		rState.Store(fix)
-		tickC <- struct{}{}
-		if prev {
-			return nil
-		}
-		return err
-	}
-	done()
-
+	rState := None
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-tickC:
-
-			switch c.State() {
-			case Closed:
+		case err, ok := <-c.sechanErr:
+			if !ok ||
+				(err == io.EOF && c.State() == Closed) {
 				return
+			}
 
-			case Open:
-				// Do nothing
-			case Broken:
+			// tell the handler the connection is broken
+			c.state.Store(Broken)
 
-				if !c.cfg.AutoReconnect {
+			if !c.cfg.AutoReconnect {
+				rState = None
+				return
+			}
+
+			rState = RecreateSecureChannel
+
+			switch err {
+			case syscall.ECONNREFUSED:
+				rState = NonRecoverable
+			}
+
+			if connErr, ok := err.(*uacp.Error); ok {
+				status := ua.StatusCode(connErr.ErrorCode)
+				switch status {
+				case ua.StatusBadSecureChannelIDInvalid:
+					rState = RecreateSecureChannel
+				case ua.StatusBadSessionIDInvalid:
+					rState = RecreateSession
+				case ua.StatusBadSubscriptionIDInvalid:
+					rState = RecreateSubscription
+				case ua.StatusBadCertificateInvalid:
+					// todo (unknownet): recreate server certificate
+					fallthrough
+				default:
+					rState = RecreateSecureChannel
+				}
+			}
+
+			// close secure channel to prevent waiting
+			// for publish timeout
+			if rState == RecreateSecureChannel {
+				c.cancelMonitor()
+				_ = c.conn.Close()
+				c.sechan.Close()
+			}
+
+			// Stop all subscriptions
+			for _, sub := range c.subscriptions {
+				sub.stop()
+			}
+
+			for rState != None && c.State() != Closed {
+
+				select {
+				case <-ctx.Done():
+					c.state.Store(Broken)
 					return
-				}
-				c.state.Store(Connecting)
+				default:
 
-				// Suspend all subscriptions
-				for _, sub := range c.subscriptions {
-					sub.lock()
-				}
-
-				for {
-					fix := rState.Load().(ReconnectState)
-					if fix == None || c.State() == Closed {
-						break
-					}
-
-					switch fix {
+					switch rState {
 					case RecreateSecureChannel:
 
 						// close previous secure channel
@@ -313,25 +294,25 @@ func (c *Client) handleConnection(ctx context.Context, done func()) {
 						debug.Printf("Trying to recreate secure channel")
 						recreateSecureChan()
 						debug.Printf("Secure channel recreated")
-						rState.Store(RestoreSession)
+						rState = RestoreSession
 
 					case RestoreSession:
 
 						debug.Printf("Trying to restore session")
 						s, err := c.DetachSession()
 						if err != nil {
-							rState.Store(RecreateSecureChannel)
+							rState = RecreateSecureChannel
 							continue
 						}
 
 						if err := c.ActivateSession(s); err != nil {
 							debug.Printf("Restore session failed")
-							rState.Store(RecreateSession)
+							rState = RecreateSession
 							continue
 						}
 						debug.Printf("Session restored")
 						c.state.Store(Open)
-						rState.Store(RestoreSubscription)
+						rState = RestoreSubscription
 
 					case RecreateSession:
 
@@ -342,20 +323,20 @@ func (c *Client) handleConnection(ctx context.Context, done func()) {
 						}
 						if err != nil {
 							debug.Printf("Recreate session failed: %v", err)
-							rState.Store(RecreateSecureChannel)
+							rState = RecreateSecureChannel
 							continue
 						}
 						c.state.Store(Open)
-						rState.Store(RecreateSubscription)
+						rState = RecreateSubscription
 
 					case RestoreSubscription:
 
 						if err := c.repairSubscriptions(); err != nil {
 							debug.Printf("Restore subscription failed: %v", err)
-							rState.Store(RecreateSecureChannel)
+							rState = RecreateSecureChannel
 							continue
 						}
-						rState.Store(None)
+						rState = None
 
 					case RecreateSubscription:
 
@@ -393,11 +374,11 @@ func (c *Client) handleConnection(ctx context.Context, done func()) {
 						if len(subsToRecreate) > 0 {
 							if err = c.recreateSubscriptionsAndMonitoredItems(subsToRecreate); err != nil {
 								debug.Printf("Recreate subscriptions failed")
-								rState.Store(RecreateSession)
+								rState = RecreateSession
 								continue
 							}
 						}
-						rState.Store(None)
+						rState = None
 
 					case NonRecoverable:
 						c.state.Store(Broken)
@@ -405,11 +386,16 @@ func (c *Client) handleConnection(ctx context.Context, done func()) {
 						return
 					}
 				}
+			}
 
-				// Resume all subscriptions
-				for _, sub := range c.subscriptions {
-					sub.unlock()
-				}
+			// empty sechan error from reconnection
+			for len(c.sechanErr) > 0 {
+				<-c.sechanErr
+			}
+
+			// Resume all subscriptions
+			for _, sub := range c.subscriptions {
+				sub.resume()
 			}
 		}
 	}
@@ -466,21 +452,25 @@ func (c *Client) monitorChannel(ctx context.Context) {
 			msg := c.sechan.Receive(ctx)
 			if msg.Err != nil {
 
-				err := c.onMonitorFailure(msg.Err)
-
-				// prevent err message from stopping monitorChannel
-				if err == nil {
-					continue
+				if c.State() == Closed {
+					return
 				}
 
-				if err == io.EOF {
+				select {
+				case c.sechanErr <- msg.Err:
+				default:
+				}
+
+				if msg.Err == io.EOF {
 					debug.Printf("Connection closed")
 				} else {
 					debug.Printf("Received error: %s", msg.Err)
 				}
 				// todo (dh): apart from the above message, we're ignoring this error because there is nothing watching it
 				// I'd prefer to have a way to return the error to the upper application.
-				return
+				if !c.cfg.AutoReconnect {
+					return
+				}
 			}
 			debug.Printf("Received unsolicited message from server: %T", msg.V)
 		}
@@ -631,6 +621,7 @@ func (c *Client) Close() error {
 	if c.cancelMonitor != nil {
 		c.cancelMonitor()
 	}
+	defer close(c.sechanErr)
 
 	return c.sechan.Close()
 }
@@ -1046,7 +1037,9 @@ func (c *Client) Subscribe(params *SubscriptionParameters, notifyCh chan *Publis
 		params,
 		make([]*MonitoredItem, 0),
 		0,
-		newLocker(),
+		nil,
+		sync.WaitGroup{},
+		make(chan struct{}, 1),
 		c,
 	}
 

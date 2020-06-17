@@ -32,7 +32,9 @@ type Subscription struct {
 	params                    *SubscriptionParameters
 	monitoredItems            []*MonitoredItem
 	lastSequenceNumber        uint32
-	locker                    *locker
+	publishCancel             context.CancelFunc
+	publishWg                 sync.WaitGroup
+	resumeC                   chan struct{}
 	c                         *Client
 }
 
@@ -84,7 +86,7 @@ type PublishNotificationData struct {
 // loops cannot deliver notifications to it anymore
 func (s *Subscription) Cancel() error {
 	s.c.forgetSubscription(s.SubscriptionID)
-	s.locker.close()
+	close(s.resumeC)
 
 	req := &ua.DeleteSubscriptionsRequest{
 		SubscriptionIDs: []uint32{s.SubscriptionID},
@@ -192,12 +194,13 @@ func (s *Subscription) publishTimeout() time.Duration {
 	return timeout
 }
 
-func (s *Subscription) lock() {
-	s.locker.lock()
+func (s *Subscription) stop() {
+	s.publishCancel()
+	s.publishWg.Wait()
 }
 
-func (s *Subscription) unlock() {
-	s.locker.unlock()
+func (s *Subscription) resume() {
+	s.resumeC <- struct{}{}
 }
 
 // Run() starts an infinite loop that sends PublishRequests and delivers received
@@ -205,6 +208,31 @@ func (s *Subscription) unlock() {
 // It is the responsibility of the user to stop no longer needed Run() loops by cancelling ctx
 // Note that Run() may return before ctx is cancelled in case of an irrecoverable communication error
 func (s *Subscription) Run(ctx context.Context) {
+	var sctx context.Context
+
+	if !s.c.cfg.AutoReconnect {
+		s.run(ctx)
+		return
+	}
+
+	for {
+		sctx, s.publishCancel = context.WithCancel(ctx)
+		s.publishWg.Add(1)
+		s.run(sctx)
+		s.publishWg.Done()
+
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-s.resumeC:
+			if !ok {
+				return
+			}
+		}
+	}
+}
+
+func (s *Subscription) run(ctx context.Context) {
 	var acks []*ua.SubscriptionAcknowledgement
 
 	for {
@@ -214,17 +242,7 @@ func (s *Subscription) Run(ctx context.Context) {
 		default:
 			// send the next publish request
 			// note that res contains data even if an error was returned
-			if s.locker.isClosed() {
-				return
-			}
-			if s.locker.isLocked() {
-				s.locker.wait()
-			}
 			res, err := s.publish(acks)
-			if s.locker.isLocked() || s.locker.isClosed() {
-				// drop the reponse
-				continue
-			}
 			switch {
 			case err == ua.StatusBadSequenceNumberUnknown:
 				// At least one ack has been submitted repeatedly
@@ -238,11 +256,7 @@ func (s *Subscription) Run(ctx context.Context) {
 				// irrecoverable error
 				s.c.notifySubscriptionsOfError(ctx, res, err)
 				debug.Printf("subscription %v Run loop stopped", s.SubscriptionID)
-				if !s.c.cfg.AutoReconnect {
-					return
-				}
-				s.locker.lock()
-				continue
+				return
 			}
 
 			if res != nil {
@@ -331,6 +345,15 @@ func (s *Subscription) recreateSubscriptionAndMonitoredItems() error {
 	}
 
 	params := s.params
+	{
+		req := &ua.DeleteSubscriptionsRequest{
+			SubscriptionIDs: []uint32{s.SubscriptionID},
+		}
+		var res *ua.DeleteSubscriptionsResponse
+		_ = s.c.Send(req, func(v interface{}) error {
+			return safeAssign(v, &res)
+		})
+	}
 	s.c.forgetSubscription(s.SubscriptionID)
 
 	req := &ua.CreateSubscriptionRequest{
@@ -348,7 +371,7 @@ func (s *Subscription) recreateSubscriptionAndMonitoredItems() error {
 	if err != nil {
 		return err
 	}
-	// TODO: check if necessary
+	// todo (unknownet): check if necessary
 	if status := res.ResponseHeader.ServiceResult; status != ua.StatusOK {
 		return status
 	}
@@ -409,71 +432,4 @@ func (s *Subscription) recreateSubscriptionAndMonitoredItems() error {
 	}
 
 	return nil
-}
-
-type locker struct {
-	locked   bool
-	closed   bool
-	lockCond *sync.Cond
-	lockMux  sync.Mutex
-}
-
-func newLocker() *locker {
-	l := locker{
-		locked: false,
-		closed: false,
-	}
-	l.lockCond = sync.NewCond(&l.lockMux)
-	return &l
-}
-
-func (l *locker) isLocked() bool {
-	l.lockMux.Lock()
-	defer l.lockMux.Unlock()
-	return l.locked
-}
-
-func (l *locker) isClosed() bool {
-	l.lockMux.Lock()
-	defer l.lockMux.Unlock()
-	return l.closed
-}
-
-func (l *locker) lock() {
-	l.lockMux.Lock()
-	defer l.lockMux.Unlock()
-	if l.locked {
-		return
-	}
-	l.locked = true
-	l.lockCond.Broadcast()
-}
-
-func (l *locker) unlock() {
-	l.lockMux.Lock()
-	defer l.lockMux.Unlock()
-	if !l.locked {
-		return
-	}
-	l.locked = false
-	l.lockCond.Broadcast()
-}
-
-func (l *locker) wait() {
-	l.lockMux.Lock()
-	defer l.lockMux.Unlock()
-	if l.closed {
-		return
-	}
-	for l.locked {
-		l.lockCond.Wait()
-	}
-}
-
-func (l *locker) close() {
-	l.lockMux.Lock()
-	defer l.lockMux.Unlock()
-	l.locked = false
-	l.closed = true
-	l.lockCond.Broadcast()
 }
