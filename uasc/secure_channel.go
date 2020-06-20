@@ -77,7 +77,8 @@ type SecureChannel struct {
 	time func() time.Time
 
 	// closing is channel used to indicate to go routines that the secure channel is closing
-	closing chan struct{}
+	closing      chan struct{}
+	disconnected chan struct{}
 
 	// closingMu is used to protect the _changing_ of the mutex
 	// i.e. when we _read_ from the closing chan we acquire a read lock, and when in `reset`, we acquire a write lock
@@ -162,6 +163,7 @@ func (s *SecureChannel) reset() {
 
 	// note: we _don't_ reset s.requestID
 	s.closing = make(chan struct{})
+	s.disconnected = make(chan struct{})
 	s.startDispatcher = sync.Once{}
 	s.instances = make(map[uint32][]*channelInstance)
 	s.chunks = make(map[uint32][]*MessageChunk)
@@ -185,6 +187,10 @@ func (s *SecureChannel) dispatcher() {
 
 	s.closingMu.RLock()
 	defer s.closingMu.RUnlock()
+
+	defer func() {
+		close(s.disconnected)
+	}()
 
 	for {
 		select {
@@ -544,10 +550,6 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 		RequestedLifetime:     s.cfg.Lifetime,
 	}
 
-	s.reqLocker.lock()
-	defer s.reqLocker.unlock()
-	s.pendingReq.Wait()
-
 	return s.sendRequestWithTimeout(req, reqID, s.openingInstance, nil, s.cfg.RequestTimeout, func(v interface{}) error {
 		resp, ok := v.(*ua.OpenSecureChannelResponse)
 		if !ok {
@@ -625,6 +627,9 @@ func (s *SecureChannel) scheduleRenewal(instance *channelInstance) {
 
 func (s *SecureChannel) renew(instance *channelInstance) error {
 	// lock ensure no one else renews this at the same time
+	s.reqLocker.lock()
+	defer s.reqLocker.unlock()
+	s.pendingReq.Wait()
 	instance.Lock()
 	defer instance.Unlock()
 
@@ -698,6 +703,9 @@ func (s *SecureChannel) sendRequestWithTimeout(
 	defer timer.Stop()
 
 	select {
+	case <-s.disconnected:
+		s.popHandler(reqID)
+		return io.EOF
 	case resp := <-ch:
 		if resp.Err != nil {
 			if resp.V != nil {
@@ -832,15 +840,12 @@ func (s *SecureChannel) Close() error {
 
 	s.reqLocker.unlock()
 	s.rcvLocker.unlock()
-	// close pending requests
-	s.handlersMu.Lock()
-	for reqID, ch := range s.handlers {
-		ch <- &response{
-			Err: io.EOF,
-		}
-		delete(s.handlers, reqID)
+
+	select {
+	case <-s.disconnected:
+		return io.EOF
+	default:
 	}
-	s.handlersMu.Unlock()
 	err := s.SendRequest(&ua.CloseSecureChannelRequest{}, nil, nil)
 
 	if err != nil {
