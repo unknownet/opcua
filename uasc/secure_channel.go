@@ -76,7 +76,7 @@ type SecureChannel struct {
 	// note: we only allow a single "open" request in flight at any point in time. The mutex is held for the entire
 	// duration of the "open" request.
 	openingInstance *channelInstance
-	openingMu       sync.Mutex
+	openingMu       sync.RWMutex
 }
 
 func NewSecureChannel(endpoint string, c *uacp.Conn, cfg *Config) (*SecureChannel, error) {
@@ -615,11 +615,15 @@ func (s *SecureChannel) sendRequestWithTimeout(
 	instance *channelInstance,
 	authToken *ua.NodeID,
 	timeout time.Duration,
-	h func(interface{}) error) error {
+	h func(interface{}) error,
+	cb ...func()) error {
 
 	respRequired := h != nil
 
 	ch, err := s.sendAsyncWithTimeout(req, reqID, instance, authToken, respRequired, timeout)
+	for _, fn := range cb {
+		fn()
+	}
 	if err != nil {
 		return err
 	}
@@ -673,12 +677,25 @@ func (s *SecureChannel) SendRequest(req ua.Request, authToken *ua.NodeID, h func
 }
 
 func (s *SecureChannel) SendRequestWithTimeout(req ua.Request, authToken *ua.NodeID, timeout time.Duration, h func(interface{}) error) error {
+	s.openingMu.RLock()
+
 	active, err := s.getActiveChannelInstance()
 	if err != nil {
+		s.openingMu.RUnlock()
 		return err
 	}
 
-	return s.sendRequestWithTimeout(req, s.nextRequestID(), active, authToken, timeout, h)
+	return s.sendRequestWithTimeout(
+		req,
+		s.nextRequestID(),
+		active,
+		authToken,
+		timeout,
+		h,
+		func() {
+			s.openingMu.RUnlock()
+		},
+	)
 }
 
 func (s *SecureChannel) sendAsyncWithTimeout(
