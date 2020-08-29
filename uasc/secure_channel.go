@@ -64,8 +64,8 @@ type SecureChannel struct {
 	activeInstance *channelInstance
 	instancesMu    sync.Mutex
 
-	// handles maps request IDs to response channels
-	handlers   map[uint32]chan *response
+	// handles maps request IDs to response callbacks
+	handlers   map[uint32]func(*response)
 	handlersMu sync.Mutex
 
 	// chunks maintains a temporary list of chunks for a given request ID
@@ -124,7 +124,7 @@ func (s *SecureChannel) reset() {
 	s.startDispatcher = sync.Once{}
 	s.instances = make(map[uint32][]*channelInstance)
 	s.chunks = make(map[uint32][]*MessageChunk)
-	s.handlers = make(map[uint32]chan *response)
+	s.handlers = make(map[uint32]func(*response))
 	s.activeInstance = nil
 	s.openingInstance = nil
 }
@@ -161,7 +161,7 @@ func (s *SecureChannel) dispatcher() {
 				debug.Printf("uasc %d/%d: recv %T", s.c.ID(), resp.ReqID, resp.V)
 			}
 
-			ch, ok := s.popHandler(resp.ReqID)
+			h, ok := s.popHandler(resp.ReqID)
 
 			if !ok {
 				debug.Printf("uasc %d/%d: no handler for %T", s.c.ID(), resp.ReqID, resp.V)
@@ -169,12 +169,7 @@ func (s *SecureChannel) dispatcher() {
 			}
 
 			debug.Printf("sending %T to handler\n", resp.V)
-			select {
-			case ch <- resp:
-			default:
-				// this should never happen since the chan is of size one
-				debug.Printf("unexpected state. channel write should always succeed.")
-			}
+			h(resp)
 		}
 	}
 }
@@ -485,13 +480,26 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 		RequestedLifetime:     s.cfg.Lifetime,
 	}
 
-	return s.sendRequestWithTimeout(req, reqID, s.openingInstance, nil, s.cfg.RequestTimeout, func(v interface{}) error {
-		resp, ok := v.(*ua.OpenSecureChannelResponse)
-		if !ok {
-			return errors.Errorf("got %T, want OpenSecureChannelResponse", v)
-		}
-		return s.handleOpenSecureChannelResponse(resp, localNonce, s.openingInstance)
-	})
+	return s.sendRequestWithTimeout(
+		req,
+		reqID,
+		s.openingInstance,
+		nil,
+		s.cfg.RequestTimeout,
+		func(v interface{}) error {
+			return nil
+		},
+		receivedHandler(func(r *response) error {
+			if r.Err != nil {
+				return r.Err
+			}
+			resp, ok := r.V.(*ua.OpenSecureChannelResponse)
+			if !ok {
+				return errors.Errorf("got %T, want OpenSecureChannelResponse", r.V)
+			}
+			return s.handleOpenSecureChannelResponse(resp, localNonce, s.openingInstance)
+		}),
+	)
 }
 
 func (s *SecureChannel) handleOpenSecureChannelResponse(resp *ua.OpenSecureChannelResponse, localNonce []byte, instance *channelInstance) (err error) {
@@ -609,6 +617,25 @@ func (s *SecureChannel) scheduleExpiration(instance *channelInstance) {
 	}
 }
 
+type requestHandlers struct {
+	sentHandlers     []func()
+	receivedHandlers []func(*response) error
+}
+
+type requestHandler func(*requestHandlers)
+
+func sentHandler(h func()) requestHandler {
+	return func(handlers *requestHandlers) {
+		handlers.sentHandlers = append(handlers.sentHandlers, h)
+	}
+}
+
+func receivedHandler(h func(*response) error) requestHandler {
+	return func(handlers *requestHandlers) {
+		handlers.receivedHandlers = append(handlers.receivedHandlers, h)
+	}
+}
+
 func (s *SecureChannel) sendRequestWithTimeout(
 	req ua.Request,
 	reqID uint32,
@@ -616,16 +643,46 @@ func (s *SecureChannel) sendRequestWithTimeout(
 	authToken *ua.NodeID,
 	timeout time.Duration,
 	h func(interface{}) error,
-	cb ...func()) error {
+	reqH ...requestHandler) error {
+
+	var handlers requestHandlers
+	for _, fn := range reqH {
+		fn(&handlers)
+	}
 
 	respRequired := h != nil
+	ch := make(chan *response, 1)
 
-	ch, err := s.sendAsyncWithTimeout(req, reqID, instance, authToken, respRequired, timeout)
-	for _, fn := range cb {
-		fn()
-	}
+	err := s.sendAsyncWithTimeout(
+		req,
+		reqID,
+		instance,
+		authToken,
+		respRequired,
+		timeout,
+		func(resp *response) {
+			if resp.Err == nil {
+				for _, fn := range handlers.receivedHandlers {
+					if err := fn(resp); err != nil {
+						resp.Err = err
+						break
+					}
+				}
+			}
+
+			select {
+			case ch <- resp:
+			default:
+				// this should never happen since the chan is of size one
+				debug.Printf("unexpected state. channel write should always succeed.")
+			}
+		},
+	)
 	if err != nil {
 		return err
+	}
+	for _, fn := range handlers.sentHandlers {
+		fn()
 	}
 
 	if !respRequired {
@@ -651,7 +708,7 @@ func (s *SecureChannel) sendRequestWithTimeout(
 	}
 }
 
-func (s *SecureChannel) popHandler(reqID uint32) (chan *response, bool) {
+func (s *SecureChannel) popHandler(reqID uint32) (func(*response), bool) {
 	s.handlersMu.Lock()
 	defer s.handlersMu.Unlock()
 
@@ -692,9 +749,9 @@ func (s *SecureChannel) SendRequestWithTimeout(req ua.Request, authToken *ua.Nod
 		authToken,
 		timeout,
 		h,
-		func() {
+		sentHandler(func() {
 			s.openingMu.RUnlock()
-		},
+		}),
 	)
 }
 
@@ -705,51 +762,48 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 	authToken *ua.NodeID,
 	respRequired bool,
 	timeout time.Duration,
-) (<-chan *response, error) {
+	h func(*response),
+) error {
 
 	instance.Lock()
 
 	m, err := instance.newRequestMessage(req, reqID, authToken, timeout)
 	if err != nil {
 		instance.Unlock()
-		return nil, err
+		return err
 	}
 
 	b, err := m.Encode()
 	if err != nil {
 		instance.Unlock()
-		return nil, err
+		return err
 	}
 
 	b, err = instance.signAndEncrypt(m, b)
 	if err != nil {
 		instance.Unlock()
-		return nil, err
+		return err
 	}
 
 	instance.Unlock()
 
-	var resp chan *response
-
 	if respRequired {
 		// register the handler if a callback was passed
-		resp = make(chan *response, 1)
-
 		s.handlersMu.Lock()
 
 		if s.handlers[reqID] != nil {
 			s.handlersMu.Unlock()
-			return nil, errors.Errorf("error: duplicate handler registration for request id %d", reqID)
+			return errors.Errorf("error: duplicate handler registration for request id %d", reqID)
 		}
 
-		s.handlers[reqID] = resp
+		s.handlers[reqID] = h
 		s.handlersMu.Unlock()
 	}
 
 	// send the message
 	var n int
 	if n, err = s.c.Write(b); err != nil {
-		return nil, err
+		return err
 	}
 
 	atomic.AddUint64(&instance.bytesSent, uint64(n))
@@ -757,7 +811,7 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 
 	debug.Printf("uasc %d/%d: send %T with %d bytes", s.c.ID(), reqID, req, len(b))
 
-	return resp, nil
+	return nil
 }
 
 func (s *SecureChannel) nextRequestID() uint32 {
