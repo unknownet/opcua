@@ -480,26 +480,39 @@ func (s *SecureChannel) open(ctx context.Context, instance *channelInstance, req
 		RequestedLifetime:     s.cfg.Lifetime,
 	}
 
-	return s.sendRequestWithTimeout(
+	ch := make(chan error, 1)
+	err = s.sendAsyncWithTimeout(
 		req,
 		reqID,
 		s.openingInstance,
 		nil,
+		true,
 		s.cfg.RequestTimeout,
-		func(v interface{}) error {
-			return nil
-		},
-		receivedHandler(func(r *response) error {
+		func(r *response) {
 			if r.Err != nil {
-				return r.Err
+				ch <- r.Err
+				return
 			}
 			resp, ok := r.V.(*ua.OpenSecureChannelResponse)
 			if !ok {
-				return errors.Errorf("got %T, want OpenSecureChannelResponse", r.V)
+				ch <- errors.Errorf("got %T, want OpenSecureChannelResponse", r.V)
+				return
 			}
-			return s.handleOpenSecureChannelResponse(resp, localNonce, s.openingInstance)
-		}),
+			ch <- s.handleOpenSecureChannelResponse(resp, localNonce, s.openingInstance)
+		},
 	)
+
+	// `+ timeoutLeniency` to give the server a chance to respond to TimeoutHint
+	timer := time.NewTimer(s.cfg.RequestTimeout + timeoutLeniency)
+	defer timer.Stop()
+
+	select {
+	case err := <-ch:
+		return err
+	case <-timer.C:
+		s.popHandler(reqID)
+		return ua.StatusBadTimeout
+	}
 }
 
 func (s *SecureChannel) handleOpenSecureChannelResponse(resp *ua.OpenSecureChannelResponse, localNonce []byte, instance *channelInstance) (err error) {
@@ -617,58 +630,32 @@ func (s *SecureChannel) scheduleExpiration(instance *channelInstance) {
 	}
 }
 
-type requestHandlers struct {
-	sentHandlers     []func()
-	receivedHandlers []func(*response) error
-}
-
-type requestHandler func(*requestHandlers)
-
-func sentHandler(h func()) requestHandler {
-	return func(handlers *requestHandlers) {
-		handlers.sentHandlers = append(handlers.sentHandlers, h)
-	}
-}
-
-func receivedHandler(h func(*response) error) requestHandler {
-	return func(handlers *requestHandlers) {
-		handlers.receivedHandlers = append(handlers.receivedHandlers, h)
-	}
-}
-
 func (s *SecureChannel) sendRequestWithTimeout(
 	req ua.Request,
 	reqID uint32,
-	instance *channelInstance,
 	authToken *ua.NodeID,
 	timeout time.Duration,
-	h func(interface{}) error,
-	reqH ...requestHandler) error {
+	h func(interface{}) error) error {
 
-	var handlers requestHandlers
-	for _, fn := range reqH {
-		fn(&handlers)
+	s.openingMu.RLock()
+
+	active, err := s.getActiveChannelInstance()
+	if err != nil {
+		s.openingMu.RUnlock()
+		return err
 	}
 
 	respRequired := h != nil
 	ch := make(chan *response, 1)
 
-	err := s.sendAsyncWithTimeout(
+	err = s.sendAsyncWithTimeout(
 		req,
 		reqID,
-		instance,
+		active,
 		authToken,
 		respRequired,
 		timeout,
 		func(resp *response) {
-			if resp.Err == nil {
-				for _, fn := range handlers.receivedHandlers {
-					if err := fn(resp); err != nil {
-						resp.Err = err
-						break
-					}
-				}
-			}
 
 			select {
 			case ch <- resp:
@@ -678,11 +665,10 @@ func (s *SecureChannel) sendRequestWithTimeout(
 			}
 		},
 	)
+	s.openingMu.RUnlock()
+
 	if err != nil {
 		return err
-	}
-	for _, fn := range handlers.sentHandlers {
-		fn()
 	}
 
 	if !respRequired {
@@ -734,25 +720,7 @@ func (s *SecureChannel) SendRequest(req ua.Request, authToken *ua.NodeID, h func
 }
 
 func (s *SecureChannel) SendRequestWithTimeout(req ua.Request, authToken *ua.NodeID, timeout time.Duration, h func(interface{}) error) error {
-	s.openingMu.RLock()
-
-	active, err := s.getActiveChannelInstance()
-	if err != nil {
-		s.openingMu.RUnlock()
-		return err
-	}
-
-	return s.sendRequestWithTimeout(
-		req,
-		s.nextRequestID(),
-		active,
-		authToken,
-		timeout,
-		h,
-		sentHandler(func() {
-			s.openingMu.RUnlock()
-		}),
-	)
+	return s.sendRequestWithTimeout(req, s.nextRequestID(), authToken, timeout, h)
 }
 
 func (s *SecureChannel) sendAsyncWithTimeout(
