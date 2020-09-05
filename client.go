@@ -83,11 +83,19 @@ func (a bySecurityLevel) Less(i, j int) bool { return a[i].SecurityLevel < a[j].
 
 type ConnectState uint8
 
+type ConnState uint8
+
 const (
-	Closed ConnectState = iota
+	// Closed, the Connection is currently closed
+	Closed ConnState = iota
+	// Connected, the Connection is currently connected
+	Connected
+	// Connecting, the Connection is currently connecting to a server for the first time
 	Connecting
-	Open
-	Broken
+	// Disconnected, the Connection is currently disconnected
+	Disconnected
+	// Reconnecting, the Connection is currently attempting to reconnect to a server it was previously connected to
+	Reconnecting
 )
 
 // Client is a high-level client for an OPC/UA server.
@@ -106,8 +114,8 @@ type Client struct {
 	conn *uacp.Conn
 
 	// sechan is the open secure channel.
-	sechan    *uasc.SecureChannel
-	sechanErr chan error
+	sechan   *uasc.SecureChannel
+	reconnch chan reconnectState
 
 	// session is the active session.
 	session atomic.Value // *Session
@@ -117,7 +125,7 @@ type Client struct {
 	subMux sync.RWMutex
 
 	// state of the client
-	state atomic.Value // ConnectState
+	state atomic.Value // ConnState
 
 	// startDispatcher ensures only one dispatcher is running
 	startDispatcher sync.Once
@@ -143,23 +151,23 @@ func NewClient(endpoint string, opts ...Option) *Client {
 		endpointURL: endpoint,
 		cfg:         cfg,
 		sessionCfg:  sessionCfg,
-		sechanErr:   make(chan error, 1),
+		reconnch:    make(chan reconnectState, 1),
 		subs:        make(map[uint32]*Subscription),
 	}
-	c.state.Store(Closed)
+	c.state.Store(Disconnected)
 	return &c
 }
 
-type ReconnectState uint8
+type reconnectState uint8
 
 const (
-	None ReconnectState = iota
-	RecreateSecureChannel
-	RestoreSession
-	RecreateSession
-	RestoreSubscription
-	RecreateSubscription
-	NonRecoverable
+	none reconnectState = iota
+	recreateSecureChannel
+	restoreSession
+	recreateSession
+	restoreSubscription
+	recreateSubscription
+	nonRecoverable
 )
 
 // Connect establishes a secure channel and creates a new session.
@@ -189,77 +197,107 @@ func (c *Client) Connect(ctx context.Context) (err error) {
 		_ = c.Close()
 		return err
 	}
-	c.state.Store(Open)
+	c.state.Store(Connected)
+	return nil
+}
+
+func (c *Client) handleError(err error) error {
+
+	// when reconnecting or disconnected forwards the errors
+	switch c.State() {
+	case Disconnected:
+		fallthrough
+	case Reconnecting:
+		debug.Printf("reconnecting... forwarding error: %v", err)
+		return err
+	case Closed:
+		return io.EOF
+	}
+
+	reconn := none
+	defer func() {
+		select {
+		case c.reconnch <- reconn:
+		default:
+			debug.Printf("unexpected state. channel write should always succeed.")
+		}
+	}()
+
+	if !c.cfg.AutoReconnect {
+		reconn = nonRecoverable
+		return io.EOF
+	}
+
+	c.state.Store(Disconnected)
+	reconn = recreateSecureChannel
+
+	if err == io.EOF {
+		return err
+	}
+
+	switch err {
+	case syscall.ECONNREFUSED:
+		reconn = nonRecoverable
+	}
+
+	if connErr, ok := err.(*uacp.Error); ok {
+		status := ua.StatusCode(connErr.ErrorCode)
+		switch status {
+		case ua.StatusBadSecureChannelIDInvalid:
+			reconn = recreateSecureChannel
+		case ua.StatusBadSessionIDInvalid:
+			reconn = recreateSession
+		case ua.StatusBadSubscriptionIDInvalid:
+			reconn = recreateSubscription
+		case ua.StatusBadCertificateInvalid:
+			// todo (unknownet): recreate server certificate
+			fallthrough
+		default:
+			reconn = recreateSecureChannel
+		}
+	}
+
 	return nil
 }
 
 // dispatcher manages connection alteration
 func (c *Client) dispatcher(ctx context.Context) {
 
-	rState := None
+	defer c.state.Store(Closed)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case err, ok := <-c.sechanErr:
-			if !ok ||
-				(err == io.EOF && c.State() == Closed) {
+		case reconn, ok := <-c.reconnch:
+
+			if !ok {
 				return
 			}
 
-			// tell the handler the connection is broken
-			c.state.Store(Broken)
-
-			if !c.cfg.AutoReconnect {
-				rState = None
-				return
-			}
-
-			rState = RecreateSecureChannel
-
-			switch err {
-			case syscall.ECONNREFUSED:
-				rState = NonRecoverable
-			}
-
-			if connErr, ok := err.(*uacp.Error); ok {
-				status := ua.StatusCode(connErr.ErrorCode)
-				switch status {
-				case ua.StatusBadSecureChannelIDInvalid:
-					rState = RecreateSecureChannel
-				case ua.StatusBadSessionIDInvalid:
-					rState = RecreateSession
-				case ua.StatusBadSubscriptionIDInvalid:
-					rState = RecreateSubscription
-				case ua.StatusBadCertificateInvalid:
-					// todo (unknownet): recreate server certificate
-					fallthrough
-				default:
-					rState = RecreateSecureChannel
-				}
-			}
+			c.state.Store(Disconnected)
 
 			// Stop all subscriptions
 			for _, sub := range c.subs {
 				sub.pause(ctx)
 			}
 
-			for rState != None && c.State() != Closed {
+			for reconn != none {
 
 				select {
 				case <-ctx.Done():
-					c.state.Store(Broken)
 					return
 
 				default:
 
-					switch rState {
-					case RecreateSecureChannel:
+					switch reconn {
+					case recreateSecureChannel:
 
 						// close previous secure channel
 						_ = c.conn.Close()
 						c.sechan.Close()
 						c.sechan = nil
+
+						c.state.Store(Reconnecting)
 
 						debug.Printf("Trying to recreate secure channel")
 						for {
@@ -275,55 +313,54 @@ func (c *Client) dispatcher(ctx context.Context) {
 							break
 						}
 						debug.Printf("Secure channel recreated")
-						rState = RestoreSession
+						reconn = restoreSession
 
-					case RestoreSession:
+					case restoreSession:
 
 						debug.Printf("Trying to restore session")
 						s, err := c.DetachSession()
 						if err != nil {
-							rState = RecreateSecureChannel
+							reconn = recreateSecureChannel
 							continue
 						}
 
 						if err := c.ActivateSession(s); err != nil {
 							debug.Printf("Restore session failed")
-							rState = RecreateSession
+							reconn = recreateSession
 							continue
 						}
 						debug.Printf("Session restored")
-						c.state.Store(Open)
-						rState = RestoreSubscription
+						reconn = restoreSubscription
 
-					case RecreateSession:
+					case recreateSession:
 
 						debug.Printf("Trying to recreate session")
 						s, err := c.CreateSession(c.sessionCfg)
 						if err != nil {
 							debug.Printf("Recreate session failed: %v", err)
-							rState = RecreateSecureChannel
+							reconn = recreateSecureChannel
 							continue
 						}
 						if err := c.ActivateSession(s); err != nil {
 							debug.Printf("Reactivate session failed: %v", err)
-							rState = RecreateSecureChannel
+							reconn = recreateSecureChannel
 							continue
 						}
-						c.state.Store(Open)
-						rState = RecreateSubscription
+						reconn = recreateSubscription
 
 					// todo(fs): shouldn't this be state RepairSubscription?
-					case RestoreSubscription:
+					case restoreSubscription:
 
 						if err := c.repairSubscriptions(c.SubscriptionIDs()); err != nil {
 							debug.Printf("Restore subscription failed: %v", err)
-							rState = RecreateSecureChannel
+							reconn = recreateSecureChannel
 							continue
 						}
-						rState = None
+						c.state.Store(Connected)
+						reconn = none
 
 					// todo(fs): shouldn't this be state RestoreSubscription?
-					case RecreateSubscription:
+					case recreateSubscription:
 
 						subIDs := c.SubscriptionIDs()
 						subsToRepair := []uint32{}
@@ -360,24 +397,20 @@ func (c *Client) dispatcher(ctx context.Context) {
 						if len(subsToRestore) > 0 {
 							if err := c.restoreSubscriptions(subsToRestore); err != nil {
 								debug.Printf("Restore subscripitions failed: %v", err)
-								rState = RecreateSession
+								reconn = recreateSession
 								continue
 							}
 						}
 
-						rState = None
+						c.state.Store(Connected)
+						reconn = none
 
-					case NonRecoverable:
-						c.state.Store(Broken)
+					case nonRecoverable:
 						// NOTE: should We store the error
+						debug.Printf("Reconnection not recoverable")
 						return
 					}
 				}
-			}
-
-			// empty sechan error from reconnection
-			for len(c.sechanErr) > 0 {
-				<-c.sechanErr
 			}
 
 			// Resume all subs
@@ -405,7 +438,7 @@ func (c *Client) Dial(ctx context.Context) error {
 		return err
 	}
 
-	c.sechan, err = uasc.NewSecureChannel(c.endpointURL, c.conn, c.cfg, c.sechanErr)
+	c.sechan, err = uasc.NewSecureChannel(c.endpointURL, c.conn, c.cfg, c.handleError)
 	if err != nil {
 		_ = c.conn.Close()
 		return err
@@ -554,14 +587,16 @@ func (c *Client) Close() error {
 	// so that we close the underlying channel and connection.
 	_ = c.CloseSession()
 	c.state.Store(Closed)
-	defer close(c.sechanErr)
-	_ = c.sechan.Close()
+	defer close(c.reconnch)
+	if c.sechan != nil {
+		_ = c.sechan.Close()
+	}
 
 	return nil
 }
 
-func (c *Client) State() ConnectState {
-	return c.state.Load().(ConnectState)
+func (c *Client) State() ConnState {
+	return c.state.Load().(ConnState)
 }
 
 // Session returns the active session.
