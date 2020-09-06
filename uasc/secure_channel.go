@@ -163,13 +163,18 @@ func (s *SecureChannel) dispatcher() {
 
 			if resp.Err != nil {
 				if err := s.fireErrorHandler(resp.Err); err != nil {
+					// EOF stops the dispatcher and the pending handlers
 					if err == io.EOF {
 						s.failsHandlers(err)
 						return
 					}
+					// nil prevent error propagation
 					if err == nil {
 						s.failsHandlers(io.EOF)
+						continue
 					}
+					// override error
+					resp.Err = err
 				}
 			}
 
@@ -679,14 +684,16 @@ func (s *SecureChannel) fireErrorHandler(err error) error {
 	return err
 }
 
-func (s *SecureChannel) failsHandlers(err error) {
+// failsHandlers stop all the pending requests
+// and make them fail with an error
+func (s *SecureChannel) failsHandlers(reason error) {
 	s.handlersMu.Lock()
 	defer s.handlersMu.Unlock()
 
 	for reqID, ch := range s.handlers {
 		delete(s.handlers, reqID)
 		select {
-		case ch <- &response{Err: err}:
+		case ch <- &response{Err: reason}:
 		default:
 			// this should never happen since the chan is of size one
 			debug.Printf("unexpected state. channel write should always succeed.")
